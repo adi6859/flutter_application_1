@@ -1,4 +1,8 @@
 allprojects {
+    ext {
+        set("playServicesLocationVersion", "21.3.0")
+    }
+
     repositories {
         google()
         mavenCentral()

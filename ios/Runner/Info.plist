@@ -45,5 +45,22 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSMotionUsageDescription</key>
+	<string>Motion activity is used to improve background location tracking accuracy.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Location is used to show your current coordinates while the app is in use.</string>
+	<key>NSLocationAlwaysUsageDescription</key>
+	<string>Location is required to maintain presence in the background.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Location is required to continue tracking in the background.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+		<string>location</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.transistorsoft.fetch</string>
+	</array>
 </dict>
 </plist>
