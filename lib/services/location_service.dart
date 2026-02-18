@@ -8,37 +8,7 @@ import 'package:h3_flutter/h3_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-class LocationUpdate {
-  const LocationUpdate({
-    required this.latitude,
-    required this.longitude,
-    required this.timestamp,
-    this.h3Cell,
-  });
-
-  final double latitude;
-  final double longitude;
-  final DateTime timestamp;
-  final String? h3Cell;
-
-  Map<String, dynamic> toJson() {
-    return <String, dynamic>{
-      'latitude': latitude,
-      'longitude': longitude,
-      'timestamp': timestamp.toUtc().toIso8601String(),
-      'h3Cell': h3Cell,
-    };
-  }
-
-  factory LocationUpdate.fromJson(Map<String, dynamic> json) {
-    return LocationUpdate(
-      latitude: (json['latitude'] as num).toDouble(),
-      longitude: (json['longitude'] as num).toDouble(),
-      timestamp: DateTime.parse(json['timestamp'] as String).toLocal(),
-      h3Cell: json['h3Cell'] as String?,
-    );
-  }
-}
+import '../models/location_update.dart';
 
 class LocationService {
   LocationService._();
@@ -47,10 +17,12 @@ class LocationService {
 
   static const int _h3Resolution = 10;
   static const Duration _minDwellDuration = Duration(minutes: 2);
-  static const Duration _heartbeatSendInterval = Duration(minutes: 20);
+  static const Duration _defaultHeartbeatSendInterval = Duration(minutes: 20);
 
   static const String _historyStorageKey = 'presence_history_v1';
-  static const int _maxHistoryEntries = 250;
+  static const String _heartbeatIntervalStorageKey =
+      'presence_heartbeat_minutes_v1';
+  static const int _maxHistoryEntries = 2000;
 
   static const double _drivingSpeedThresholdMps = 8.0;
   static const double _drivingDistanceFilterMeters = 500.0;
@@ -59,6 +31,7 @@ class LocationService {
   static final Uri _presenceApiUri = Uri.parse(
     'https://example.com/api/presence',
   );
+  static const bool _syncToBackend = false;
   static final bool _debugLogsEnabled = kDebugMode;
 
   final H3 _h3 = const H3Factory().load();
@@ -78,14 +51,38 @@ class LocationService {
   DateTime? _cellEnterTime;
   DateTime? _lastSentTime;
   String? _lastSentCell;
+  String _lastActivity = 'still';
   bool _isDriving = false;
+  Duration _heartbeatSendInterval = _defaultHeartbeatSendInterval;
 
   final List<LocationUpdate> _history = <LocationUpdate>[];
+
+  bool get _supportsNativeTracking => !kIsWeb;
 
   Stream<LocationUpdate> get locationStream => _locationController.stream;
   Stream<List<LocationUpdate>> get historyStream => _historyController.stream;
   List<LocationUpdate> get historySnapshot =>
       List<LocationUpdate>.unmodifiable(_history);
+  int get heartbeatIntervalMinutes => _heartbeatSendInterval.inMinutes;
+
+  Future<void> setHeartbeatIntervalMinutes(int minutes) async {
+    if (minutes <= 0) return;
+
+    _heartbeatSendInterval = Duration(minutes: minutes);
+    await _persistHeartbeatInterval();
+
+    if (!_supportsNativeTracking || !_isInitialized) {
+      return;
+    }
+
+    try {
+      await bg.BackgroundGeolocation.setConfig(
+        bg.Config(heartbeatInterval: _heartbeatSendInterval.inSeconds),
+      );
+    } catch (error, stackTrace) {
+      _log('setHeartbeatIntervalMinutes failed: $error', stackTrace);
+    }
+  }
 
   List<LocationUpdate> getHistoryForDay(DateTime day) {
     final dayStart = DateTime(day.year, day.month, day.day);
@@ -99,6 +96,14 @@ class LocationService {
         .toList(growable: false);
   }
 
+  Future<void> clearHistory() async {
+    _history.clear();
+    _lastSentTime = null;
+    _lastSentCell = null;
+    _emitHistory();
+    await _persistHistory();
+  }
+
   Future<void> initialize() {
     if (_isInitialized) return Future.value();
     return _initializeFuture ??= _initializeInternal();
@@ -106,13 +111,19 @@ class LocationService {
 
   Future<void> _initializeInternal() async {
     try {
+      await _loadHeartbeatIntervalFromStorage();
       await _loadHistoryFromStorage();
+
+      if (!_supportsNativeTracking) {
+        _isInitialized = true;
+        return;
+      }
 
       if (!_listenersRegistered) {
         bg.BackgroundGeolocation.onLocation(_onLocation, (
           bg.LocationError error,
         ) {
-          debugPrint('[onLocation] ERROR: ${error.code}, ${error.message}');
+          _log('[onLocation] ERROR: ${error.code}, ${error.message}');
         });
         bg.BackgroundGeolocation.onMotionChange(_onMotionChange);
         bg.BackgroundGeolocation.onActivityChange(_onActivityChange);
@@ -126,7 +137,7 @@ class LocationService {
           distanceFilter: _normalDistanceFilterMeters,
           stopTimeout: 3,
           activityRecognitionInterval: 10000,
-          heartbeatInterval: 1200,
+          heartbeatInterval: _heartbeatSendInterval.inSeconds,
           disableElasticity: false,
           stopOnTerminate: false,
           startOnBoot: true,
@@ -154,11 +165,27 @@ class LocationService {
   Future<void> startTracking() async {
     try {
       await initialize();
+      if (!_supportsNativeTracking) {
+        _isTracking = false;
+        return;
+      }
+
+      try {
+        final authStatus = await bg.BackgroundGeolocation.requestPermission();
+        _log('requestPermission result: $authStatus');
+      } catch (error, stackTrace) {
+        _log('requestPermission failed: $error', stackTrace);
+      }
+
       final state = await bg.BackgroundGeolocation.state;
       if (!state.enabled) {
         await bg.BackgroundGeolocation.start();
       }
       _isTracking = true;
+
+      if (_isHeartbeatDue(DateTime.now())) {
+        unawaited(_sendHeartbeatFromCurrentPosition());
+      }
     } catch (error, stackTrace) {
       _log('LocationService.startTracking failed: $error', stackTrace);
       rethrow;
@@ -167,6 +194,10 @@ class LocationService {
 
   Future<void> stopTracking() async {
     try {
+      if (!_supportsNativeTracking) {
+        _isTracking = false;
+        return;
+      }
       final state = await bg.BackgroundGeolocation.state;
       if (state.enabled) {
         await bg.BackgroundGeolocation.stop();
@@ -184,10 +215,13 @@ class LocationService {
     final speed = location.coords.speed.toDouble();
     final now = DateTime.now();
 
-    _emitUiLocation(latitude, longitude);
+    _emitUiLocation(
+      latitude: latitude,
+      longitude: longitude,
+      accuracyMeters: location.coords.accuracy,
+    );
 
-    if (_isDriving) return;
-    if (speed > _drivingSpeedThresholdMps) return;
+    if (_isDriving || speed > _drivingSpeedThresholdMps) return;
 
     final newCellIndex = _h3.geoToCell(
       GeoCoord(lat: latitude, lon: longitude),
@@ -215,7 +249,13 @@ class LocationService {
     final heartbeatDue = _isHeartbeatDue(now);
 
     if (isUnsyncedCell || heartbeatDue) {
-      unawaited(_sendAndMark(latitude: latitude, longitude: longitude));
+      unawaited(
+        _sendAndMark(
+          latitude: latitude,
+          longitude: longitude,
+          accuracyMeters: location.coords.accuracy,
+        ),
+      );
     }
   }
 
@@ -224,11 +264,22 @@ class LocationService {
 
     final latitude = location.coords.latitude;
     final longitude = location.coords.longitude;
-    _emitUiLocation(latitude, longitude);
-    unawaited(_sendAndMark(latitude: latitude, longitude: longitude));
+    _emitUiLocation(
+      latitude: latitude,
+      longitude: longitude,
+      accuracyMeters: location.coords.accuracy,
+    );
+    unawaited(
+      _sendAndMark(
+        latitude: latitude,
+        longitude: longitude,
+        accuracyMeters: location.coords.accuracy,
+      ),
+    );
   }
 
   void _onActivityChange(bg.ActivityChangeEvent event) {
+    _lastActivity = event.activity;
     final bool nowDriving =
         event.activity == 'in_vehicle' && event.confidence > 70;
 
@@ -257,7 +308,8 @@ class LocationService {
   }
 
   void _onHeartbeat(bg.HeartbeatEvent event) {
-    if (_isDriving || !_isTracking) return;
+    if (_isDriving) return;
+    if (!_isTracking) return;
 
     final now = DateTime.now();
     if (!_isHeartbeatDue(now)) return;
@@ -275,6 +327,7 @@ class LocationService {
       await _sendAndMark(
         latitude: location.coords.latitude,
         longitude: location.coords.longitude,
+        accuracyMeters: location.coords.accuracy,
       );
     } catch (error, stackTrace) {
       _log('getCurrentPosition/send heartbeat failed: $error', stackTrace);
@@ -289,24 +342,35 @@ class LocationService {
   Future<void> _sendAndMark({
     required double latitude,
     required double longitude,
+    double? accuracyMeters,
   }) async {
-    try {
-      final sentAt = DateTime.now();
-      await _sendPresenceToServer(latitude: latitude, longitude: longitude);
-      _lastSentTime = sentAt;
-      _lastSentCell = _currentCell;
+    final sentAt = DateTime.now();
 
-      await _addHistory(
-        LocationUpdate(
-          latitude: latitude,
-          longitude: longitude,
-          timestamp: sentAt,
-          h3Cell: _currentCell,
-        ),
-      );
-    } catch (error, stackTrace) {
-      _log('Presence send failed: $error', stackTrace);
+    await _addHistory(
+      LocationUpdate(
+        latitude: latitude,
+        longitude: longitude,
+        timestamp: sentAt,
+        h3Cell: _currentCell,
+        activity: _lastActivity,
+        accuracyMeters: accuracyMeters,
+      ),
+    );
+
+    if (_syncToBackend) {
+      try {
+        await _sendPresenceToServer(latitude: latitude, longitude: longitude);
+      } catch (error, stackTrace) {
+        _log('Presence send failed: $error', stackTrace);
+      } finally {
+        _lastSentTime = sentAt;
+        _lastSentCell = _currentCell;
+      }
+      return;
     }
+
+    _lastSentTime = sentAt;
+    _lastSentCell = _currentCell;
   }
 
   Future<void> _sendPresenceToServer({
@@ -333,7 +397,11 @@ class LocationService {
     }
   }
 
-  void _emitUiLocation(double latitude, double longitude) {
+  void _emitUiLocation({
+    required double latitude,
+    required double longitude,
+    double? accuracyMeters,
+  }) {
     if (_locationController.isClosed) return;
     _locationController.add(
       LocationUpdate(
@@ -341,6 +409,8 @@ class LocationService {
         longitude: longitude,
         timestamp: DateTime.now(),
         h3Cell: _currentCell,
+        activity: _lastActivity,
+        accuracyMeters: accuracyMeters,
       ),
     );
   }
@@ -379,6 +449,30 @@ class LocationService {
       _historyLoaded = true;
       _log('Loading history failed: $error', stackTrace);
       _emitHistory();
+    }
+  }
+
+  Future<void> _loadHeartbeatIntervalFromStorage() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final minutes = prefs.getInt(_heartbeatIntervalStorageKey);
+      if (minutes != null && minutes > 0) {
+        _heartbeatSendInterval = Duration(minutes: minutes);
+      }
+    } catch (error, stackTrace) {
+      _log('Loading heartbeat interval failed: $error', stackTrace);
+    }
+  }
+
+  Future<void> _persistHeartbeatInterval() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(
+        _heartbeatIntervalStorageKey,
+        _heartbeatSendInterval.inMinutes,
+      );
+    } catch (error, stackTrace) {
+      _log('Persisting heartbeat interval failed: $error', stackTrace);
     }
   }
 
